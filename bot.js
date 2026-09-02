@@ -15,9 +15,9 @@ const bot = new TelegramBot(process.env.BOT_TOKEN, {
 const userState = {};
 const MAX_RANGE = 1000n;
 
-/* =========================================================
-   NORMALIZE TEXT
-   ========================================================= */
+const PAGE_TIMEOUT = 10000;
+const PAGE_WAIT = 500;
+const MAX_RETRIES = 2;
 
 function normalize(text) {
   return String(text || "")
@@ -28,8 +28,8 @@ function normalize(text) {
 }
 
 /* =========================================================
-   START COMMAND
-   ========================================================= */
+   START
+========================================================= */
 
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
@@ -46,7 +46,7 @@ bot.onText(/\/start/, async (msg) => {
 
 /* =========================================================
    MESSAGE FLOW
-   ========================================================= */
+========================================================= */
 
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
@@ -58,7 +58,11 @@ bot.on("message", async (msg) => {
   const state = userState[chatId];
 
   try {
+
+    /* FROM */
+
     if (state.step === "FROM") {
+
       if (!/^\d+$/.test(text.trim())) {
         return bot.sendMessage(
           chatId,
@@ -69,10 +73,16 @@ bot.on("message", async (msg) => {
       state.from = text.trim();
       state.step = "TO";
 
-      return bot.sendMessage(chatId, "🔢 Enter TO ISTP No.:");
+      return bot.sendMessage(
+        chatId,
+        "🔢 Enter TO ISTP No.:"
+      );
     }
 
+    /* TO */
+
     if (state.step === "TO") {
+
       if (!/^\d+$/.test(text.trim())) {
         return bot.sendMessage(
           chatId,
@@ -83,10 +93,16 @@ bot.on("message", async (msg) => {
       state.to = text.trim();
       state.step = "DISTRICT";
 
-      return bot.sendMessage(chatId, "📍 Enter District Name:");
+      return bot.sendMessage(
+        chatId,
+        "📍 Enter District Name:"
+      );
     }
 
+    /* DISTRICT */
+
     if (state.step === "DISTRICT") {
+
       state.district = text.trim();
 
       await bot.sendMessage(
@@ -95,31 +111,47 @@ bot.on("message", async (msg) => {
         `🔢 Range: ${state.from} → ${state.to}`
       );
 
-      const results = await checkRange(
+      const summary = await checkRange(
         state.from,
         state.to,
         state.district,
         chatId
       );
 
-      if (results.length === 0) {
-        await bot.sendMessage(chatId, "❌ No matching ISTP found.");
+      if (summary.matches === 0) {
+
+        if (summary.failed > 0) {
+
+          await bot.sendMessage(
+            chatId,
+            `⚠️ No matching result could be confirmed.\n\n` +
+            `❗ ${summary.failed} ISTP page(s) could not be fetched from UP Mines server.\n` +
+            `Therefore they were NOT treated as "No matching ISTP".`
+          );
+
+        } else {
+
+          await bot.sendMessage(
+            chatId,
+            "❌ No matching ISTP found."
+          );
+
+        }
+
       } else {
+
         await bot.sendMessage(
           chatId,
-          `✅ Found ${results.length} matching ISTP(s).`
+          `✅ Found ${summary.matches} matching ISTP(s).`
         );
 
-        for (const item of results) {
-          const message =
-`ISTP: ${item.istp}
-Origin Transit Pass No.: ${item.originalTransitPassNo || "Not Found"}
-Destination District: ${item.destinationDistrict || "Not Available"}
-Valid Up To: ${item.validUpto || "Not Available"}
-Generated On: ${item.generatedOn || "Not Available"}
-Qty: ${item.qty || "Not Available"}`;
+        if (summary.failed > 0) {
 
-          await bot.sendMessage(chatId, message);
+          await bot.sendMessage(
+            chatId,
+            `⚠️ ${summary.failed} ISTP page(s) could not be fetched.`
+          );
+
         }
       }
 
@@ -130,16 +162,24 @@ Qty: ${item.qty || "Not Available"}`;
 
       delete userState[chatId];
     }
+
   } catch (err) {
+
     console.error("FLOW ERROR:", err);
 
     try {
+
       await bot.sendMessage(
         chatId,
         `❌ Error occurred.\n\n${err.message || "Unknown error"}`
       );
+
     } catch (sendError) {
-      console.error("TELEGRAM ERROR:", sendError);
+
+      console.error(
+        "TELEGRAM ERROR:",
+        sendError
+      );
     }
 
     delete userState[chatId];
@@ -147,10 +187,16 @@ Qty: ${item.qty || "Not Available"}`;
 });
 
 /* =========================================================
-   RANGE SCRAPER
-   ========================================================= */
+   SCRAPER
+========================================================= */
 
-async function checkRange(fromNo, toNo, districtInput, chatId) {
+async function checkRange(
+  fromNo,
+  toNo,
+  districtInput,
+  chatId
+) {
+
   const start = BigInt(fromNo);
   const end = BigInt(toNo);
 
@@ -161,19 +207,27 @@ async function checkRange(fromNo, toNo, districtInput, chatId) {
   }
 
   if (end - start > MAX_RANGE) {
-    throw new Error("Range exceeds 1000 numbers.");
+    throw new Error(
+      "Range exceeds 1000 numbers."
+    );
   }
 
-  // Cloud/server friendly: no visible browser window.
   const browser = await puppeteer.launch({
+
     headless: true,
+
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
-      "--disable-gpu"
+      "--disable-gpu",
+      "--disable-http2"
     ],
-    defaultViewport: null
+
+    defaultViewport: {
+      width: 1366,
+      height: 768
+    }
   });
 
   const page = await browser.newPage();
@@ -184,51 +238,119 @@ async function checkRange(fromNo, toNo, districtInput, chatId) {
     "Chrome/139.0.0.0 Safari/537.36"
   );
 
-  const results = [];
-  let counter = 0;
+  await page.setExtraHTTPHeaders({
+    "Accept-Language": "en-US,en;q=0.9"
+  });
+
   const normalizedInput = normalize(districtInput);
 
+  let matches = 0;
+  let failed = 0;
+  let counter = 0;
+
   try {
-    for (let num = start; num <= end; num++) {
+
+    for (
+      let num = start;
+      num <= end;
+      num++
+    ) {
+
       const istpNo = num.toString();
       counter++;
 
-      if (counter % 50 === 0) {
-        await bot.sendMessage(
-          chatId,
-          `🔄 Checked ${counter} ISTP numbers...`
-        );
-      }
+      console.log(
+        `Checking ISTP: ${istpNo}`
+      );
 
       const url =
-        "https://upmines.upsdc.gov.in//Transporter/" +
+        "https://upmines.upsdc.gov.in/" +
+        "Transporter/" +
         "PrintTransporterFormVehicleCheckValidOrNot.aspx?eId=" +
         encodeURIComponent(istpNo);
 
-      console.log(`Checking ISTP: ${istpNo}`);
+      let loaded = false;
 
-      try {
-        await page.goto(url, {
-          waitUntil: "networkidle2",
-          timeout: 15000
-        });
-      } catch (pageError) {
-        console.error(
-          `PAGE ERROR - ${istpNo}:`,
-          pageError.message
+      /* ==========================================
+         RETRY
+      ========================================== */
+
+      for (
+        let attempt = 1;
+        attempt <= MAX_RETRIES;
+        attempt++
+      ) {
+
+        try {
+
+          console.log(
+            `Loading ${istpNo} - attempt ${attempt}`
+          );
+
+          await page.goto(url, {
+
+            waitUntil: "domcontentloaded",
+
+            timeout: PAGE_TIMEOUT
+          });
+
+          loaded = true;
+          break;
+
+        } catch (pageError) {
+
+          console.error(
+            `PAGE ERROR - ${istpNo} - attempt ${attempt}:`,
+            pageError.message
+          );
+
+          if (attempt < MAX_RETRIES) {
+
+            await new Promise(
+              resolve => setTimeout(resolve, 500)
+            );
+
+          }
+        }
+      }
+
+      /* ==========================================
+         PAGE NOT AVAILABLE
+      ========================================== */
+
+      if (!loaded) {
+
+        failed++;
+
+        console.log(
+          `SKIPPED - ${istpNo} could not be fetched`
         );
+
         continue;
       }
 
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(
+        resolve => setTimeout(resolve, PAGE_WAIT)
+      );
+
+      /* ==========================================
+         EXTRACT DATA
+      ========================================== */
 
       const data = await page.evaluate(() => {
+
         const result = {
+
           istp: "",
+
           originalTransitPassNo: "",
+
           destinationDistrict: "",
+
           validUpto: "",
+
           generatedOn: "",
+
           qty: ""
         };
 
@@ -237,48 +359,83 @@ async function checkRange(fromNo, toNo, districtInput, chatId) {
             .replace(/\s+/g, " ")
             .trim();
 
-        const rows = document.querySelectorAll("table tr");
+        const rows =
+          document.querySelectorAll("table tr");
 
         rows.forEach((row) => {
-          const cells = row.querySelectorAll("td");
 
-          for (let i = 0; i < cells.length - 1; i += 2) {
-            const label = clean(cells[i].innerText).toLowerCase();
-            const value = clean(cells[i + 1].innerText);
+          const cells =
+            row.querySelectorAll("td");
 
-            if (label.includes("istp no")) {
+          for (
+            let i = 0;
+            i < cells.length - 1;
+            i += 2
+          ) {
+
+            const label =
+              clean(cells[i].innerText)
+                .toLowerCase();
+
+            const value =
+              clean(cells[i + 1].innerText);
+
+            if (
+              label.includes("istp no")
+            ) {
               result.istp = value;
             }
 
-            // Screenshot field: "15. Origin Transit Pass No:"
             if (
-              label.includes("origin transit pass no") ||
-              label.includes("origin transit pass")
+              label.includes(
+                "origin transit pass no"
+              ) ||
+              label.includes(
+                "origin transit pass"
+              )
             ) {
-              result.originalTransitPassNo = value;
-            }
-
-            if (label.includes("destination district")) {
-              result.destinationDistrict = value;
+              result.originalTransitPassNo =
+                value;
             }
 
             if (
-              label.includes("transit pass valid upto") ||
-              label.includes("valid upto") ||
-              label.includes("valid up to")
+              label.includes(
+                "destination district"
+              )
+            ) {
+              result.destinationDistrict =
+                value;
+            }
+
+            if (
+              label.includes(
+                "transit pass valid upto"
+              ) ||
+              label.includes(
+                "valid upto"
+              ) ||
+              label.includes(
+                "valid up to"
+              )
             ) {
               result.validUpto = value;
             }
 
             if (
-              label.includes("transit pass generated on") ||
-              label.includes("generated on")
+              label.includes(
+                "transit pass generated on"
+              ) ||
+              label.includes(
+                "generated on"
+              )
             ) {
               result.generatedOn = value;
             }
 
             if (
-              label.includes("qty transported") ||
+              label.includes(
+                "qty transported"
+              ) ||
               label.includes("qty")
             ) {
               result.qty = value;
@@ -286,46 +443,82 @@ async function checkRange(fromNo, toNo, districtInput, chatId) {
           }
         });
 
-        // Fallback: inspect visible text if the label/value is not
-        // represented as a simple two-cell pair.
-        const pageText = clean(document.body.innerText);
-        const lines = document.body.innerText
-          .split(/\r?\n/)
-          .map(clean)
-          .filter(Boolean);
+        /* ======================================
+           FALLBACK TEXT EXTRACTION
+        ====================================== */
+
+        const bodyText =
+          clean(document.body.innerText);
+
+        const lines =
+          document.body.innerText
+            .split(/\r?\n/)
+            .map(clean)
+            .filter(Boolean);
 
         if (!result.istp) {
-          const m = pageText.match(
-            /ISTP\s*No\.?\s*:?\s*(\d+)/i
-          );
-          if (m) result.istp = m[1];
+
+          const match =
+            bodyText.match(
+              /ISTP\s*No\.?\s*:?\s*(\d+)/i
+            );
+
+          if (match) {
+            result.istp = match[1];
+          }
         }
 
         if (!result.originalTransitPassNo) {
-          for (let i = 0; i < lines.length; i++) {
+
+          for (
+            let i = 0;
+            i < lines.length;
+            i++
+          ) {
+
             if (
-              /origin\s+transit\s+pass\s+no/i.test(lines[i])
+              /origin\s+transit\s+pass\s+no/i
+                .test(lines[i])
             ) {
-              const sameLine = lines[i].match(
-                /origin\s+transit\s+pass\s+no\.?\s*:?\s*(\d+)/i
-              );
+
+              const sameLine =
+                lines[i].match(
+                  /origin\s+transit\s+pass\s+no\.?\s*:?\s*(\d+)/i
+                );
 
               if (sameLine) {
-                result.originalTransitPassNo = sameLine[1];
+
+                result.originalTransitPassNo =
+                  sameLine[1];
+
                 break;
               }
 
-              for (let j = 1; j <= 3; j++) {
+              for (
+                let j = 1;
+                j <= 3;
+                j++
+              ) {
+
                 if (
                   lines[i + j] &&
-                  /^\d+$/.test(lines[i + j])
+                  /^\d+$/.test(
+                    lines[i + j]
+                  )
                 ) {
-                  result.originalTransitPassNo = lines[i + j];
+
+                  result.originalTransitPassNo =
+                    lines[i + j];
+
                   break;
                 }
               }
 
-              if (result.originalTransitPassNo) break;
+              if (
+                result.originalTransitPassNo
+              ) {
+                break;
+              }
             }
           }
         }
@@ -333,29 +526,93 @@ async function checkRange(fromNo, toNo, districtInput, chatId) {
         return result;
       });
 
-      const normalizedPageDistrict = normalize(
-        data.destinationDistrict
-      );
+      /* ==========================================
+         DISTRICT MATCH
+      ========================================== */
+
+      const normalizedPageDistrict =
+        normalize(
+          data.destinationDistrict
+        );
 
       const districtMatched =
         normalizedPageDistrict &&
+        normalizedInput &&
         (
-          normalizedPageDistrict.includes(normalizedInput) ||
-          normalizedInput.includes(normalizedPageDistrict)
+          normalizedPageDistrict
+            .includes(normalizedInput) ||
+          normalizedInput
+            .includes(normalizedPageDistrict)
         );
 
       if (districtMatched) {
-        if (!data.istp) data.istp = istpNo;
 
-        results.push(data);
+        if (!data.istp) {
+          data.istp = istpNo;
+        }
 
-        console.log("MATCH FOUND:", data);
+        matches++;
+
+        console.log(
+          "MATCH FOUND:",
+          data
+        );
+
+        /* ======================================
+           SEND RESULT IMMEDIATELY
+        ====================================== */
+
+        const message =
+          `ISTP: ${data.istp}\n` +
+          `Origin Transit Pass No.: ${
+            data.originalTransitPassNo ||
+            "Not Found"
+          }\n` +
+          `Destination District: ${
+            data.destinationDistrict ||
+            "Not Available"
+          }\n` +
+          `Valid Up To: ${
+            data.validUpto ||
+            "Not Available"
+          }\n` +
+          `Generated On: ${
+            data.generatedOn ||
+            "Not Available"
+          }\n` +
+          `Qty: ${
+            data.qty ||
+            "Not Available"
+          }`;
+
+        await bot.sendMessage(
+          chatId,
+          message
+        );
+      }
+
+      /* ==========================================
+         PROGRESS
+      ========================================== */
+
+      if (counter % 25 === 0) {
+
+        await bot.sendMessage(
+          chatId,
+          `🔄 Checked ${counter} ISTP numbers...`
+        );
       }
     }
 
     await browser.close();
-    return results;
+
+    return {
+      matches,
+      failed
+    };
+
   } catch (err) {
+
     try {
       await browser.close();
     } catch (closeError) {
@@ -370,13 +627,39 @@ async function checkRange(fromNo, toNo, districtInput, chatId) {
 }
 
 /* =========================================================
-   GLOBAL ERROR HANDLERS
-   ========================================================= */
+   TELEGRAM ERROR HANDLING
+========================================================= */
 
-process.on("unhandledRejection", (err) => {
-  console.error("UNHANDLED:", err);
+bot.on("polling_error", (error) => {
+
+  console.error(
+    "TELEGRAM POLLING ERROR:",
+    error.message
+  );
 });
 
-process.on("uncaughtException", (err) => {
-  console.error("UNCAUGHT:", err);
-});
+/* =========================================================
+   GLOBAL ERRORS
+========================================================= */
+
+process.on(
+  "unhandledRejection",
+  (err) => {
+
+    console.error(
+      "UNHANDLED:",
+      err
+    );
+  }
+);
+
+process.on(
+  "uncaughtException",
+  (err) => {
+
+    console.error(
+      "UNCAUGHT:",
+      err
+    );
+  }
+);
