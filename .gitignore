@@ -1,0 +1,5 @@
+node_modules/
+id.env
+.env
+npm-debug.log*
+.DS_Store
