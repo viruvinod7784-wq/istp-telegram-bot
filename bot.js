@@ -210,7 +210,7 @@ async function checkRange(fromNo, toNo, districtInput, chatId) {
       try {
         await page.goto(url, {
           waitUntil: "networkidle2",
-          timeout: 60000
+          timeout: 15000
         });
       } catch (pageError) {
         console.error(
@@ -220,7 +220,7 @@ async function checkRange(fromNo, toNo, districtInput, chatId) {
         continue;
       }
 
-      await new Promise(resolve => setTimeout(resolve, 4000));
+      await new Promise(resolve => setTimeout(resolve, 1000));
 
       const data = await page.evaluate(() => {
         const result = {
